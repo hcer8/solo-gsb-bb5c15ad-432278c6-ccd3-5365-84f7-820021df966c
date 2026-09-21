@@ -21,6 +21,14 @@ class EventConflictError(Exception):
         self.event_id = event_id
 
 
+class BatchConflictError(Exception):
+    """批量事件与库中已存记录内容冲突（整批未写入）。"""
+
+    def __init__(self, event_ids: list[str]) -> None:
+        super().__init__(", ".join(event_ids))
+        self.event_ids = event_ids
+
+
 class EventNotFoundError(Exception):
     pass
 
@@ -97,10 +105,74 @@ class EventStore:
             raise EventConflictError(event_id)
         return _row_to_event(row), created
 
+    def create_events_batch(self, items: list[tuple[str, str, Any]]) -> list[tuple[dict, bool]]:
+        """批量幂等写入：冲突检查与全部插入在单一事务内完成。
+
+        items 需已按 event_id 去重（批内归并在 API 层完成）。任一 event_id
+        与库中记录内容冲突则整批零写入并抛 BatchConflictError；否则返回与
+        items 顺序对齐的 (事件记录, 是否新建) 列表。连接级锁 + BEGIN IMMEDIATE
+        使并发批次彼此串行：要么整批提交，要么整批回滚，不产生部分提交，
+        也不会覆盖首个版本。
+        """
+        if not items:
+            return []
+        prepared = [
+            (event_id, type_, payload, content_hash(type_, payload))
+            for event_id, type_, payload in items
+        ]
+        ids = [event_id for event_id, _, _, _ in prepared]
+        placeholders = ", ".join("?" for _ in ids)
+        with self.db.lock:
+            self.db.conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self.db.conn.execute(
+                    f"SELECT * FROM events WHERE event_id IN ({placeholders})", ids
+                ).fetchall()
+                existing = {row["event_id"]: row for row in rows}
+                conflicts = [
+                    event_id
+                    for event_id, _, _, digest in prepared
+                    if event_id in existing and existing[event_id]["content_hash"] != digest
+                ]
+                if conflicts:
+                    raise BatchConflictError(conflicts)
+                for event_id, type_, payload, digest in prepared:
+                    if event_id in existing:
+                        continue
+                    self.db.conn.execute(
+                        """
+                        INSERT INTO events
+                            (event_id, type, payload, content_hash, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event_id,
+                            type_,
+                            canonical_json(payload),
+                            digest,
+                            STATUS_PENDING,
+                            utcnow_iso(),
+                        ),
+                    )
+                rows = self.db.conn.execute(
+                    f"SELECT * FROM events WHERE event_id IN ({placeholders})", ids
+                ).fetchall()
+                self.db.conn.execute("COMMIT")
+            except Exception:
+                if self.db.conn.in_transaction:
+                    self.db.conn.execute("ROLLBACK")
+                raise
+        by_id = {row["event_id"]: row for row in rows}
+        return [
+            (_row_to_event(by_id[event_id]), event_id not in existing)
+            for event_id, _, _, _ in prepared
+        ]
+
     def get_event(self, event_id: str) -> dict:
-        row = self.db.conn.execute(
-            "SELECT * FROM events WHERE event_id = ?", (event_id,)
-        ).fetchone()
+        with self.db.lock:
+            row = self.db.conn.execute(
+                "SELECT * FROM events WHERE event_id = ?", (event_id,)
+            ).fetchone()
         if row is None:
             raise EventNotFoundError(event_id)
         return _row_to_event(row)
@@ -119,10 +191,12 @@ class EventStore:
             clauses.append("(created_at > ? OR (created_at = ? AND event_id > ?))")
             params.extend([c_created, c_created, c_id])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self.db.conn.execute(
-            f"SELECT * FROM events {where} ORDER BY created_at, event_id LIMIT ?",
-            (*params, limit + 1),
-        ).fetchall()
+        # 与批量写入共用一条连接，加锁保证不会读到未提交事务的中间状态
+        with self.db.lock:
+            rows = self.db.conn.execute(
+                f"SELECT * FROM events {where} ORDER BY created_at, event_id LIMIT ?",
+                (*params, limit + 1),
+            ).fetchall()
         has_more = len(rows) > limit
         items = [_row_to_event(r) for r in rows[:limit]]
         next_cursor = (

@@ -8,6 +8,10 @@
   - 并发重复请求只保留**首个版本**，所有重复请求返回与首次一致的结果
   - 相同 `event_id` 但内容（`type` 或 `payload`）不同 → **409 Conflict**
   - 内容比对是语义级的：JSON 键序不同但内容相同视为同一事件
+- **POST /events/batch** 原子批量提交（1~100 个事件，结构同单条接口）
+  - 批内同 `event_id` 内容语义相同 → 视为重复，映射到同一结果；内容不同 → **422** 并标出冲突下标
+  - 与库中记录内容冲突 → **409** 并标出对应下标，**整批零写入**
+  - 无冲突时**单一事务**写入全部新事件，按原输入顺序返回记录与每项 `created` 标记
 - **GET /events** 按时间游标分页查询（键集分页，支持 `status` 过滤）
 - **POST /events/{event_id}/ack** 单条确认（幂等，重复确认返回当前状态）
 - **GET /events/{event_id}** 查询单条事件
@@ -39,6 +43,7 @@ docker run -d -p 8000:8000 -v webhook-data:/data webhook-inbox
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/events` | 提交事件。首次 `201`，重复（内容相同）`200`，内容冲突 `409` |
+| POST | `/events/batch` | 原子批量提交（1~100 个）。有新事件 `201`，全部重复 `200`；批内冲突 `422`、与库冲突 `409`，均整批零写入 |
 | GET | `/events?limit=&cursor=&status=` | 时间游标分页查询，`limit` 默认 50、最大 200 |
 | GET | `/events/{event_id}` | 查询单条事件，不存在 `404` |
 | POST | `/events/{event_id}/ack` | 确认事件（幂等），不存在 `404` |
@@ -69,6 +74,54 @@ curl -i -X POST http://localhost:8000/events \
 
 ```json
 {"detail": "event_id 'evt-001' already exists with different content"}
+```
+
+### 批量提交事件
+
+```bash
+curl -i -X POST http://localhost:8000/events/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"event_id": "evt-101", "type": "order.paid", "payload": {"amount": 100}},
+      {"event_id": "evt-102", "type": "order.paid", "payload": {"amount": 200}},
+      {"event_id": "evt-101", "type": "order.paid", "payload": {"amount": 100}}
+    ]
+  }'
+```
+
+一次提交 1~100 个事件（结构与单条接口相同），整批原子写入：要么全部落库，要么零写入。响应按**原输入顺序**返回，每项附带 `created` 标记；批内相同 `event_id` 且内容语义相同（键序无关）视为重复，映射到同一结果（下例中第 1、3 项完全相同）。任一事件为新事件时返回 `201`，全部已存在时返回 `200`：
+
+```json
+{
+  "items": [
+    {"event_id": "evt-101", "type": "order.paid", "payload": {"amount": 100}, "status": "pending", "created_at": "2026-09-21T03:00:00.000000Z", "acked_at": null, "created": true},
+    {"event_id": "evt-102", "type": "order.paid", "payload": {"amount": 200}, "status": "pending", "created_at": "2026-09-21T03:00:00.000100Z", "acked_at": null, "created": true},
+    {"event_id": "evt-101", "type": "order.paid", "payload": {"amount": 100}, "status": "pending", "created_at": "2026-09-21T03:00:00.000000Z", "acked_at": null, "created": true}
+  ]
+}
+```
+
+批内同一 `event_id` 内容不同 → `422`，标出冲突下标，整批零写入：
+
+```json
+{
+  "detail": {
+    "message": "duplicate event_id with different content in batch",
+    "conflicts": [{"event_id": "evt-101", "indices": [0, 2]}]
+  }
+}
+```
+
+与库中已存事件内容冲突 → `409`，同样标出对应下标，整批零写入且已存首版不被覆盖：
+
+```json
+{
+  "detail": {
+    "message": "events already exist with different content",
+    "conflicts": [{"event_id": "evt-101", "indices": [1]}]
+  }
+}
 ```
 
 ### 分页查询
@@ -105,7 +158,8 @@ curl -X POST http://localhost:8000/events/evt-001/ack
 ## 幂等与并发设计
 
 - 写入路径为 `INSERT OR IGNORE` + 同事务回读，由连接级锁保证原子性；SQLite（WAL 模式）串行化并发写，因此并发重复请求中只有一个真正落库，其余请求读到首个版本并原样返回。
-- 内容指纹 = `SHA-256(type + 规范化JSON(payload))`（键排序、去空白），指纹不同即 `409`，已存数据不会被覆盖。
+- 内容指纹 = `SHA-256(type + 规范化JSON(payload))`（键排序、去空白），指纹不同即 `409`，已存数据不会被覆盖。批量接口在批内归并与库级比对中复用同一套指纹规则。
+- 批量写入在**单一事务**内完成「查库比对 + 全部插入 + 回读」（连接级锁 + `BEGIN IMMEDIATE`），并发批次彼此串行：任一冲突即整批回滚，不产生部分提交，也不会覆盖首个版本。
 
 ## 配置
 
@@ -119,7 +173,7 @@ curl -X POST http://localhost:8000/events/evt-001/ack
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/ -q                 # 15 个测试：幂等、409、分页、ack、并发、持久化
+pytest tests/ -q                 # 28 个测试：幂等、409、分页、ack、批量原子性、并发、持久化
 DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 ```
 

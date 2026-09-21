@@ -6,7 +6,12 @@ from fastapi.testclient import TestClient
 
 from app.db import Database
 from app.main import app
-from app.store import EventConflictError, EventStore
+from app.store import (
+    BatchConflictError,
+    EventConflictError,
+    EventNotFoundError,
+    EventStore,
+)
 
 
 @pytest.fixture()
@@ -148,6 +153,109 @@ def test_healthz(client):
     assert client.get("/healthz").json() == {"status": "ok"}
 
 
+# ---------- 批量接口 ----------
+
+
+def test_batch_create_all_new(client):
+    events = [make_event(i) for i in range(3)]
+    r = client.post("/events/batch", json={"events": events})
+    assert r.status_code == 201
+    items = r.json()["items"]
+    assert [it["event_id"] for it in items] == [e["event_id"] for e in events]  # 原输入顺序
+    assert all(it["created"] for it in items)
+    assert all(it["status"] == "pending" for it in items)
+    for e in events:  # 全部落库
+        assert client.get(f"/events/{e['event_id']}").status_code == 200
+
+
+def test_batch_intra_duplicates_map_to_same_result(client):
+    events = [
+        {"event_id": "e1", "type": "t", "payload": {"a": 1, "b": 2}},
+        {"event_id": "e2", "type": "t", "payload": {"x": 1}},
+        {"event_id": "e1", "type": "t", "payload": {"b": 2, "a": 1}},  # 键序不同，语义相同
+    ]
+    r = client.post("/events/batch", json={"events": events})
+    assert r.status_code == 201
+    items = r.json()["items"]
+    assert items[0] == items[2]  # 重复项映射到同一结果（含 created 标记）
+    assert items[0]["created"] is True
+    assert len(client.get("/events").json()["items"]) == 2  # 只落库两条
+
+
+def test_batch_intra_conflict_returns_422_and_zero_writes(client):
+    events = [
+        {"event_id": "e1", "type": "t", "payload": {"v": 1}},
+        {"event_id": "e2", "type": "t", "payload": {"v": 2}},
+        {"event_id": "e1", "type": "t", "payload": {"v": 999}},
+    ]
+    r = client.post("/events/batch", json={"events": events})
+    assert r.status_code == 422
+    assert r.json()["detail"]["conflicts"] == [{"event_id": "e1", "indices": [0, 2]}]
+    assert client.get("/events").json()["items"] == []  # 整批零写入
+
+
+def test_batch_db_conflict_returns_409_and_zero_writes(client):
+    client.post("/events", json={"event_id": "e1", "type": "t", "payload": {"v": 1}})
+    events = [
+        {"event_id": "e2", "type": "t", "payload": {"v": 2}},
+        {"event_id": "e1", "type": "t", "payload": {"v": 999}},  # 与库中首版冲突
+    ]
+    r = client.post("/events/batch", json={"events": events})
+    assert r.status_code == 409
+    assert r.json()["detail"]["conflicts"] == [{"event_id": "e1", "indices": [1]}]
+    assert client.get("/events/e2").status_code == 404  # 整批零写入
+    assert client.get("/events/e1").json()["payload"] == {"v": 1}  # 首版未被覆盖
+
+
+def test_batch_db_conflict_reports_all_indices_of_duplicates(client):
+    client.post("/events", json={"event_id": "e1", "type": "t", "payload": {"v": 1}})
+    dup = {"event_id": "e1", "type": "t", "payload": {"v": 2}}
+    r = client.post("/events/batch", json={"events": [dup, make_event(5), dup]})
+    assert r.status_code == 409
+    assert r.json()["detail"]["conflicts"] == [{"event_id": "e1", "indices": [0, 2]}]
+    assert client.get("/events/evt-0005").status_code == 404
+
+
+def test_batch_existing_same_content_marked_not_created(client):
+    first = client.post("/events", json=make_event(1)).json()
+    r = client.post("/events/batch", json={"events": [make_event(1), make_event(2)]})
+    assert r.status_code == 201  # 含有新事件
+    items = r.json()["items"]
+    assert items[0]["created"] is False
+    assert items[0]["created_at"] == first["created_at"]  # 返回库中首个版本
+    assert items[1]["created"] is True
+
+
+def test_batch_all_duplicates_returns_200(client):
+    client.post("/events", json=make_event(1))
+    r = client.post("/events/batch", json={"events": [make_event(1), make_event(1)]})
+    assert r.status_code == 200
+    assert all(not it["created"] for it in r.json()["items"])
+
+
+def test_batch_returns_current_state_for_existing(client):
+    client.post("/events", json=make_event(1))
+    client.post("/events/evt-0001/ack")
+    r = client.post("/events/batch", json={"events": [make_event(1)]})
+    assert r.status_code == 200
+    item = r.json()["items"][0]
+    assert item["created"] is False
+    assert item["status"] == "acked"  # 返回库中当前状态，不回退
+
+
+def test_batch_size_limits(client):
+    assert client.post("/events/batch", json={"events": []}).status_code == 422
+    too_many = {"events": [make_event(i) for i in range(101)]}
+    assert client.post("/events/batch", json=too_many).status_code == 422
+    exactly_max = {"events": [make_event(i) for i in range(100)]}
+    assert client.post("/events/batch", json=exactly_max).status_code == 201
+
+
+def test_batch_validation_error(client):
+    assert client.post("/events/batch", json={}).status_code == 422
+    assert client.post("/events/batch", json={"events": [{"event_id": "x"}]}).status_code == 422
+
+
 # ---------- 存储层：并发与持久化 ----------
 
 
@@ -194,3 +302,55 @@ def test_persistence_across_reopen(tmp_path):
     assert rec["acked_at"]
     assert rec["payload"] == {"k": 1}
     s2.db.close()
+
+
+# ---------- 存储层：批量原子性 ----------
+
+
+def test_store_batch_conflict_rolls_back_everything(store):
+    store.create_event("evt-1", "t", {"v": 1})
+    with pytest.raises(BatchConflictError) as exc_info:
+        store.create_events_batch([("evt-2", "t", {"v": 2}), ("evt-1", "t", {"v": 9})])
+    assert exc_info.value.event_ids == ["evt-1"]
+    with pytest.raises(EventNotFoundError):
+        store.get_event("evt-2")  # 整批零写入
+    assert store.get_event("evt-1")["payload"] == {"v": 1}
+
+
+def test_concurrent_identical_batches_single_created(store):
+    batch = [("evt-b1", "t", {"k": 1}), ("evt-b2", "t", {"k": 2})]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = list(pool.map(lambda _: store.create_events_batch(batch), range(16)))
+
+    for pos in range(2):
+        assert sum(created for _, created in (res[pos] for res in outcomes)) == 1
+    first_records = [rec for rec, _ in outcomes[0]]
+    assert all([rec for rec, _ in res] == first_records for res in outcomes)  # 均为首个版本
+
+
+def test_concurrent_conflicting_batches_no_partial_commit(store):
+    def submit(i):
+        tag = "a" if i % 2 == 0 else "b"
+        try:
+            res = store.create_events_batch(
+                [("evt-shared", "t", {"v": tag}), (f"evt-uniq-{i}", "t", {"v": i})]
+            )
+            return (tag, res)
+        except BatchConflictError:
+            return (tag, None)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(submit, range(32)))
+
+    winner = store.get_event("evt-shared")["payload"]["v"]
+    # 与首版内容一致的批次整批成功，其余整批冲突
+    assert sum(created for tag, res in results if res for _, created in [res[0]]) == 1
+    for i, (tag, res) in enumerate(results):
+        if tag == winner:
+            assert res is not None
+            assert store.get_event(f"evt-uniq-{i}")["payload"] == {"v": i}
+        else:
+            assert res is None
+            with pytest.raises(EventNotFoundError):
+                store.get_event(f"evt-uniq-{i}")  # 冲突批次零写入，无部分提交
